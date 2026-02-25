@@ -406,6 +406,7 @@ document.write(`
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">编译安装</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">指定环境变量</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#windows-installation-with-fp8-triton-support">Windows Installation (with FP8 Triton Support)</a></li>
 </ul>
             </nav>
         </div>
@@ -490,6 +491,61 @@ python<span class="w"> </span>setup.py<span class="w"> </span>install
 <p>指定环境变量后，需要和执行压缩算法的脚本在同一终端执行，比如放在同一个shell脚本内，先export PYTHONPATH环境变量，然后运行压缩程序代码。</p>
 </div>
 </section>
+<section id="windows-installation-with-fp8-triton-support">
+<h2>Windows Installation (with FP8 Triton Support)<a class="headerlink" href="#windows-installation-with-fp8-triton-support" title="Link to this heading">#</a></h2>
+<p>AngelSlim supports Windows with FP8 Triton kernels. Follow these steps to build from source:</p>
+<div class="highlight-batch notranslate"><div class="highlight"><pre><span></span><span class="p">:</span><span class="c1">: Clone the repository</span>
+git clone https://github.com/Tencent/AngelSlim.git
+<span class="k">cd</span> AngelSlim
+
+<span class="p">:</span><span class="c1">: Create and activate virtual environment (Python 3.10 recommended)</span>
+uv venv --python 3.10
+.venv\Scripts\activate
+
+<span class="p">:</span><span class="c1">: Install base dependencies</span>
+uv pip install packaging wheel setuptools ninja numpy==1.26.4 pip build psutil
+
+<span class="p">:</span><span class="c1">: Install PyTorch with CUDA 12.8 support</span>
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+
+<span class="p">:</span><span class="c1">: Install Triton for Windows</span>
+uv pip install -U triton-windows
+
+<span class="p">:</span><span class="c1">: Configure Visual Studio build environment</span>
+<span class="k">set</span> <span class="nv">INCLUDE</span><span class="p">=</span>
+<span class="k">set</span> <span class="nv">LIB</span><span class="p">=</span>
+<span class="k">set</span> <span class="nv">LIBPATH</span><span class="p">=</span>
+<span class="k">call</span> <span class="s2">&quot;C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat&quot;</span> x64
+
+<span class="p">:</span><span class="c1">: Configure CUDA environment</span>
+<span class="k">set</span> <span class="nv">CUDA_HOME</span><span class="p">=</span>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+<span class="k">set</span> <span class="nv">PATH</span><span class="p">=</span><span class="nv">%CUDA_HOME%</span>\bin;<span class="nv">%PATH%</span>
+<span class="k">set</span> <span class="nv">DISTUTILS_USE_SDK</span><span class="p">=</span>1
+
+<span class="p">:</span><span class="c1">: Set target CUDA architectures (adjust based on your GPU)</span>
+<span class="k">set</span> <span class="nv">TORCH_CUDA_ARCH_LIST</span><span class="p">=</span>8.0;8.6;8.9;9.0
+
+<span class="p">:</span><span class="c1">: Build the wheel</span>
+<span class="k">set</span> <span class="nv">DG_USE_LOCAL_VERSION</span><span class="p">=</span>0
+python setup.py bdist_wheel
+
+<span class="p">:</span><span class="c1">: Verify FP8 Triton kernels are working</span>
+python -c <span class="s2">&quot;import torch; from angelslim.compressor.diffusion.kernels.python.quantizers import fp8_per_block_quant_triton; from angelslim.compressor.diffusion.kernels.python.gemm import fp8_gemm_triton_block; a,b=torch.randn(128,256,device=&#39;cuda&#39;),torch.randn(512,256,device=&#39;cuda&#39;); aq,a_s=fp8_per_block_quant_triton(a); bq,b_s=fp8_per_block_quant_triton(b); c=fp8_gemm_triton_block(aq,a_s,bq,b_s); print(f&#39;FP8 GEMM OK: {c.shape}, {c.dtype}&#39;)&quot;</span>
+</pre></div>
+</div>
+<p><strong>Requirements:</strong></p>
+<ul class="simple">
+<li><p>Windows 10/11 with NVIDIA GPU (Ampere or newer recommended)</p></li>
+<li><p>Visual Studio 2022 with C++ build tools</p></li>
+<li><p>CUDA Toolkit 12.8</p></li>
+<li><p>Python 3.10</p></li>
+</ul>
+<p><strong>Environment Variables:</strong></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">ANGELSLIM_BACKEND</span></code>: Force backend selection (<code class="docutils literal notranslate"><span class="pre">triton</span></code> or <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">ANGELSLIM_TORCH_COMPILE</span></code>: Enable/disable torch.compile (<code class="docutils literal notranslate"><span class="pre">0</span></code> or <code class="docutils literal notranslate"><span class="pre">1</span></code>)</p></li>
+</ul>
+</section>
 </section>
 
 
@@ -547,6 +603,7 @@ python<span class="w"> </span>setup.py<span class="w"> </span>install
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id5">编译安装</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id6">指定环境变量</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#windows-installation-with-fp8-triton-support">Windows Installation (with FP8 Triton Support)</a></li>
 </ul>
   </nav></div>
 

@@ -1,6 +1,6 @@
 # Global configuration of pipeline
 global:
-  save_path: /root/gavinlee-code/work/w4a8/model/ckpts/w4a8/qwen3_awq_int4_static
+  save_path: ./output
 
 
 # Simplified Configuration for LLM compression
@@ -30,7 +30,7 @@ compression:
 # Dataset for calibration
 dataset:
   name: TextDataset
-  data_path: /root/gavinlee-code/work/w4a8/question_format1.jsonl
+  data_path: ./dataset/sharegpt_gpt4_qwen/sharegpt_gpt4-qwen3_a22B_output.jsonl
   max_seq_length: 2048
   num_samples: 32
   batch_size: 1

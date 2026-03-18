@@ -2,7 +2,6 @@
 global:
   save_path: ./output
 
-
 # Simplified Configuration for LLM compression
 model:
   name: Qwen

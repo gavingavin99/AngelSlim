@@ -274,27 +274,6 @@ def run(config):
     # Step 6: Compress model
     slim_engine.run()
 
-    def find_modules_with_hooks(model: torch.nn.Module):
-        """查找并打印模型中所有带有 hook 的子模块"""
-        hooked_modules = {}
-        for name, module in model.named_modules():
-            hooks_info = []
-            if len(module._forward_hooks) > 0:
-                hooks_info.append(f"forward_hooks: {len(module._forward_hooks)}")
-            if len(module._forward_pre_hooks) > 0:
-                hooks_info.append(f"forward_pre_hooks: {len(module._forward_pre_hooks)}")
-            # if len(module._backward_hooks) > 0:
-            #     hooks_info.append(f"backward_hooks: {len(module._backward_hooks)}")
-            # if len(module._backward_pre_hooks) > 0:
-            #     hooks_info.append(f"backward_pre_hooks: {len(module._backward_pre_hooks)}")
-
-            if hooks_info:
-                # 如果 name 为空字符串，代表是模型的最外层(顶层)
-                display_name = name if name else "Top-level Model"
-                hooked_modules[display_name] = hooks_info
-
-        return hooked_modules
-
     # Step 7: Eval
     if args.lm_eval:
         slim_engine.lm_eval(

@@ -32,5 +32,5 @@ dataset:
   name: TextDataset
   data_path: ./dataset/sharegpt_gpt4_qwen/sharegpt_gpt4-qwen3_a22B_output.jsonl
   max_seq_length: 4096
-  num_samples: 256
+  num_samples: 128
   batch_size: 1

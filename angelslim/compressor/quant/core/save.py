@@ -838,7 +838,7 @@ class DeepSeekV3PTQSaveMulti(PTQSaveBase):
         print_info("Save quantization_config: {}".format(quant_dict))
         return "model-" + "{:0>{}}".format(model_save_ind, 5) + ".safetensors"
 
-    def g(
+    def _transform_keys(
         self,
         param_name,
         param,
@@ -852,10 +852,6 @@ class DeepSeekV3PTQSaveMulti(PTQSaveBase):
                 substring in param_name
                 for substring in self.quant_model.quant_config.quant_algo_info["ignore_layers"]
             ):
-                # debug
-                val = scales_dict.get(f"{param_name}_scale.int4")
-                print(f"[DEBUG] {param_name}_scale.int4 type = {type(val)}, value = {val}")
-                assert isinstance(val, torch.Tensor), f"Expected tensor but got {type(val)}"
 
                 if param_name.endswith("weight_scale_inv"):
                     return

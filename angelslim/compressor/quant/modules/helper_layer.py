@@ -34,6 +34,7 @@ from ..core import (
     reduce_block_padding,
     tensor_quant_dequant_fp8,
     tensor_quant_dequant_int,
+    unpack_weight_omni,
 )
 
 
@@ -547,19 +548,23 @@ class QDQModule(torch.nn.Module):
         super().__init__()
         self.quant_algo = quant_algo
         weight_scale = weight_scale.to(weight.device)
+        self.group_size = group_size
         if "fp8" in quant_algo:
             if "w4a8" in self.quant_algo:
                 max_value_group_wise = weight_scale.clone()
+                # weight(bf16) -> fp8 -> int4
+                # dweight(int4) -> fp8 -> weight(bf16)
                 tensor_wise_scale = max_value_group_wise.max() / 448.0
-                quant_weight, _ = quantize_weight_per_tensor_fp8(weight, tensor_wise_scale)
-                new_weight_bf16 = quant_weight.to(torch.bfloat16) * tensor_wise_scale
-
+                # quant_weight, _ = quantize_weight_per_tensor_fp8(weight, tensor_wise_scale)
+                # new_weight_bf16 = quant_weight.to(torch.bfloat16) * tensor_wise_scale
+                new_weight_bf16 = weight
                 new_weight_bf16_qdq = fake_quant_dequant(
                     new_weight_bf16, method="groupwise", bits=4, group_size=group_size
                 )
                 quant_weight, _ = quantize_weight_int(
                     new_weight_bf16_qdq, max_value_group_wise, bits=4
                 )
+
                 quant_weight = pack_weight_to_int8(quant_weight)
                 del new_weight_bf16_qdq, new_weight_bf16
                 self.weight_scale_int4 = torch.nn.Parameter(
@@ -576,6 +581,7 @@ class QDQModule(torch.nn.Module):
 
         if "w4a8" in self.quant_algo:
             self.qweight = torch.nn.Parameter(quant_weight, requires_grad=False)
+            # self.qweight = torch.nn.Parameter(quant_weight, requires_grad=False)
         else:
             self.weight = torch.nn.Parameter(quant_weight, requires_grad=False)
         weight_scale = weight_scale.view(-1) if weight_scale.ndim == 0 else weight_scale
@@ -600,11 +606,30 @@ class QDQModule(torch.nn.Module):
                 raise ValueError(f"Unsupported quantization algorithm: {self.quant_algo}")
 
         if "fp8" in self.quant_algo:
+            if "w4a8" in self.quant_algo:
+                # unpack, save as int32
+                weight = self.qweight.to(qinput.device)
+                weight = unpack_weight_omni(weight, save_bit=4, pack_bit=8)
+                weight_scale = self.weight_scale.to(qinput.device)
+
+                scale = (
+                    self.weight_scale_int4.float()
+                    .repeat_interleave(self.group_size, dim=-1)
+                    .to(qinput.device)
+                )  # (out,in)
+                # dequant to bf16
+                weight = weight * scale
+                # quant to fp8
+                weight, _ = quantize_weight_per_tensor_fp8(weight, weight_scale)
+                # to fp8
+            else:
+                weight = self.weight.to(qinput.device)
+                weight_scale = self.weight_scale.to(qinput.device)
             output = gemm_fp8(
                 act=qinput,
                 act_scale=self.input_scale,
-                weight=self.weight,
-                weight_scale=self.weight_scale,
+                weight=weight,
+                weight_scale=weight_scale,
                 bias=self.bias,
                 out_dtype=x.dtype,
             )

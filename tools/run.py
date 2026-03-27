@@ -335,22 +335,17 @@ def run(config):
     # Step 6: Compress model
     slim_engine.run()
 
-    # Step 7: Eval
+    # Step 7: Convert model
+    slim_engine.convert()
+
+    # Step 8: Eval
     if args.ppl_eval:
-        slim_engine.ppl_eval(
-            tasks="wikitext2,c4",
-            seqlen=dataset_config.max_seq_length,
-            cache_dir=compress_config.QAT.hf_cache_dir,
-        )
+        slim_engine.ppl_eval(tasks="wikitext2,c4", seqlen=dataset_config.max_seq_length)
 
     if args.lm_eval:
-        slim_engine.lm_eval(
-            tasks="piqa,arc_easy,arc_challenge,hellaswag,winogrande",
-            batch_size=32,
-            num_fewshot=0,
-        )
+        slim_engine.lm_eval(tasks="arc_challenge,hellaswag", batch_size=32, num_fewshot=0)
 
-    # Step 8: Save compressed model
+    # Step 9: Save compressed model
     slim_engine.save(global_config.save_path, config)
 
 

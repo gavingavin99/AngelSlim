@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from ..base import TransformBase
 from ..factory import TransformFactory
-from .fuse_norm_utils import center_embeddings, fuse_ln_linear
+from .fuse_norm_utils import fuse_ln_linear
 from .hadamard_utils import hadamard_matrix, random_hadamard_matrix
 from .mapping import linear_mapping as default_linear_mapping
 from .mapping import norm_mapping as default_norm_mapping
@@ -388,12 +388,6 @@ class SpinQuant(TransformBase):
         self.logger.info("Applying fused layer norm to a linear layer")
 
         self._untie_word_embeddings()
-
-        for _, embedding in self.quant_model.get_rotation_mapping_layers(
-            None,
-            linear_mapping=([self.linear_mapping["embedding"]], self.ignore_layers),
-        ).items():
-            center_embeddings(embedding)
 
         norm_layers = self.quant_model.get_rotation_mapping_layers(
             None,

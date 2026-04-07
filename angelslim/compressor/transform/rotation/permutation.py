@@ -149,8 +149,36 @@ class Permutation(TransformBase):
 
         # multi-thread
         def process_down_proj(name, down_proj):
+            # If weight is on meta device, materialise it via _hf_hook first.
+            hook, original_exec_device = None, None
+            if down_proj.weight.is_meta:
+                hook = getattr(down_proj, "_hf_hook", None)
+                if hook is None:
+                    print_info(
+                        f"[warning] '{name}' weight is on meta device and has no "
+                        "_hf_hook; cannot compute R4 permutation, skipping"
+                    )
+                    return name, None
+                original_exec_device, hook.execution_device = (
+                    hook.execution_device,
+                    self.perm_config.device,
+                )
+                hook.pre_forward(down_proj)
+                if down_proj.weight.is_meta:
+                    print_info(
+                        f"[warning] '{name}' weight is still meta after hook.pre_forward; skipping"
+                    )
+                    hook.post_forward(down_proj, None)
+                    hook.execution_device = original_exec_device
+                    return name, None
+
+            # Unified path: compute permutation and apply it.
             perm = get_r4_permutation(down_proj.weight.data.to(device=self.perm_config.device))
-            self._permute_down_proj(down_proj, perm)
+            self._permute_down_proj(name, down_proj, perm)
+
+            if hook is not None:
+                hook.post_forward(down_proj, None)
+                hook.execution_device = original_exec_device
             return name, perm
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -160,7 +188,8 @@ class Permutation(TransformBase):
             ]
             for future in concurrent.futures.as_completed(futures):
                 name, perm = future.result()
-                self.permutations[name] = perm
+                if perm is not None:
+                    self.permutations[name] = perm
         print_info(f"Permutation down_proj done. {len(self.permutations)} layer(s) processed.")
 
         def process_mlp_in(name, linear):
@@ -168,7 +197,7 @@ class Permutation(TransformBase):
             if perm is None:
                 print_info(f"[warning] No matching permutation for {name}, skipping")
                 return
-            self._permute_mlp_in(linear, perm)
+            self._permute_mlp_in(name, linear, perm)
             return name, perm
 
         mlp_in_sucess_count = 0
@@ -204,21 +233,87 @@ class Permutation(TransformBase):
         return self.permutations[best_key] if best_key is not None else None
 
     @torch.no_grad()
-    def _permute_down_proj(self, linear: torch.nn.Linear, perm: torch.Tensor):
+    def _permute_down_proj(self, name: str, linear: torch.nn.Linear, perm: torch.Tensor):
         """Reorder input channels (dim 1) of down_proj in-place."""
+        if linear.weight.is_meta:
+            self._meta_permute(name, linear, perm, dim=1)
+            return
         origin_device = linear.weight.device
         w = linear.weight.data.to(device=self.perm_config.device)
         linear.weight.data = w[:, perm].to(device=origin_device)
 
     @torch.no_grad()
-    def _permute_mlp_in(self, linear: torch.nn.Linear, perm: torch.Tensor):
+    def _permute_mlp_in(self, name: str, linear: torch.nn.Linear, perm: torch.Tensor):
         """Reorder output channels (dim 0) of up_proj / gate_proj in-place."""
+        if linear.weight.is_meta:
+            self._meta_permute(name, linear, perm, dim=0)
+            return
         origin_device = linear.weight.device
         w = linear.weight.data.to(device=self.perm_config.device)
         linear.weight.data = w[perm, :].to(device=origin_device)
         if hasattr(linear, "bias") and linear.bias is not None:
             b = linear.bias.data.to(device=self.perm_config.device)
             linear.bias.data = b[perm].to(device=origin_device)
+
+    @torch.no_grad()
+    def _meta_permute(self, name: str, linear: torch.nn.Linear, perm: torch.Tensor, dim: int):
+        """Apply channel permutation to a linear layer whose weight lives on the meta device.
+
+        When a model is loaded with accelerate offloading, parameters may reside
+        on the ``meta`` device; actual data is managed by an ``_hf_hook``.
+        This function materialises the weight by triggering the hook, applies
+        the permutation (equivalent to the non-meta path in
+        :meth:`_permute_down_proj` / :meth:`_permute_mlp_in`), and lets the
+        hook offload the updated weight afterwards.
+
+        Args:
+            name: Fully-qualified layer name (used for logging).
+            linear: The linear module whose weight is a meta tensor.
+            perm: 1-D permutation index tensor.
+            dim: Dimension along which to permute.
+                ``0`` → reorder output channels (up_proj / gate_proj).
+                ``1`` → reorder input  channels (down_proj).
+        """
+        hook = getattr(linear, "_hf_hook", None)
+        if hook is None:
+            print_info(
+                f"[_meta_permute] '{name}' has no _hf_hook attached; "
+                "cannot materialise weight, skipping"
+            )
+            return
+
+        # Redirect execution_device to perm_config.device to avoid OOM when
+        # materialising large weights that would otherwise land on GPU.
+        original_exec_device = hook.execution_device
+        hook.execution_device = self.perm_config.device
+        hook.pre_forward(linear)
+
+        if linear.weight.is_meta:
+            print_info(
+                f"[_meta_permute] '{name}' weight is still meta after hook.pre_forward; skipping"
+            )
+            hook.post_forward(linear, None)
+            hook.execution_device = original_exec_device
+            return
+
+        origin_dtype = linear.weight.dtype
+        w = linear.weight.data.to(device=self.perm_config.device)
+
+        if dim == 1:
+            # Reorder input channels: weight[:, perm]
+            linear.weight.data = w[:, perm].to(dtype=origin_dtype, device=self.perm_config.device)
+        else:
+            # Reorder output channels: weight[perm, :]
+            linear.weight.data = w[perm, :].to(dtype=origin_dtype, device=self.perm_config.device)
+            if hasattr(linear, "bias") and linear.bias is not None:
+                b = linear.bias.data.to(device=self.perm_config.device)
+                linear.bias.data = b[perm].to(
+                    dtype=linear.bias.dtype, device=self.perm_config.device
+                )
+
+        # Let the hook offload the updated weight back to its storage, then restore device.
+        hook.post_forward(linear, None)
+        hook.execution_device = original_exec_device
 
     def get_permutations(self) -> Dict[str, torch.Tensor]:
         """Return the per-layer permutation index tensors (keyed by down_proj name)."""

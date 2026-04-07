@@ -31,6 +31,7 @@ def get_args():
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--multi-nodes", action="store_true")
     parser.add_argument("--lm-eval", action="store_true")
+    parser.add_argument("--lm-eval-task", nargs="+", default=["ceval-valid"])
     parser.add_argument("--ppl-eval", action="store_true")
     args = parser.parse_args()
     return args

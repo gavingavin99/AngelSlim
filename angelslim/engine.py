@@ -335,7 +335,9 @@ class Engine:
                 outputs = model.model(batch)
                 if classifier is not None:
                     hidden_states = outputs[0]
-                    logits = classifier(hidden_states.to(classifier.weight.dtype))
+                    logits = classifier(
+                        hidden_states.to(classifier.weight.dtype).to(classifier.weight.device)
+                    )
                 else:
                     logits = outputs[0]
                 shift_logits = logits[:, :-1, :]

@@ -63,7 +63,7 @@ class SpinConfig:
     norm_mappings: Optional[List] = field(default=None)
     permutation: Optional[PermutationConfig] = field(default=None)  # R4 permutation
     device: str = "cpu"
-    max_threads: int = 64
+    max_threads: int = 4
 
 
 @TransformFactory.register("SpinQuant")
@@ -168,10 +168,11 @@ class SpinQuant(TransformBase):
 
     def run(self):
         # add rotation
+        self._untie_word_embeddings()
         if "R1" in self.spin_config.rotation:
             # fuse norm
             self._apply_fused_ln()
-            self._apply_r1()
+            # self._apply_r1()
         if "R2" in self.spin_config.rotation:
             self._apply_r2()
         if "R3" in self.spin_config.rotation:

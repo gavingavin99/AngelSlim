@@ -581,7 +581,6 @@ class QDQModule(torch.nn.Module):
 
         if "w4a8" in self.quant_algo:
             self.qweight = torch.nn.Parameter(quant_weight, requires_grad=False)
-            # self.qweight = torch.nn.Parameter(quant_weight, requires_grad=False)
         else:
             self.weight = torch.nn.Parameter(quant_weight, requires_grad=False)
         weight_scale = weight_scale.view(-1) if weight_scale.ndim == 0 else weight_scale

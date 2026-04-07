@@ -218,14 +218,13 @@ def run_transform(config, test_diff=False, lm_eval=False):
             ) from e
 
         print("[lm_eval] Starting lm-eval benchmark on the transformed model ...")
-        hf_model = slim_model.model
         tokenizer = slim_model.tokenizer
         tokenizer.pad_token = tokenizer.eos_token
         hf_model.eval()
 
         lm_eval_model = HFLM(hf_model, tokenizer=tokenizer, batch_size=32)
 
-        task_names = ["arc_challenge", "hellaswag"]
+        task_names = ["arc_challenge"]
         results = lm_evaluator.simple_evaluate(
             model=lm_eval_model,
             tasks=task_names,

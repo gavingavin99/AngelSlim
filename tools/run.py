@@ -343,7 +343,11 @@ def run(config):
         slim_engine.ppl_eval(tasks="wikitext2,c4", seqlen=dataset_config.max_seq_length)
 
     if args.lm_eval:
-        slim_engine.lm_eval(tasks="arc_challenge,hellaswag", batch_size=32, num_fewshot=0)
+        slim_engine.lm_eval(
+            tasks="piqa,arc_easy,arc_challenge,hellaswag,winogrande",
+            batch_size=32,
+            num_fewshot=0,
+        )
 
     # Step 9: Save compressed model
     slim_engine.save(global_config.save_path, config)

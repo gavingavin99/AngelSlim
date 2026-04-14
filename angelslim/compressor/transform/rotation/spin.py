@@ -168,11 +168,11 @@ class SpinQuant(TransformBase):
 
     def run(self):
         # add rotation
-        self._untie_word_embeddings()
         if "R1" in self.spin_config.rotation:
+            self._untie_word_embeddings()
             # fuse norm
             self._apply_fused_ln()
-            # self._apply_r1()
+            self._apply_r1()
         if "R2" in self.spin_config.rotation:
             self._apply_r2()
         if "R3" in self.spin_config.rotation:
@@ -379,6 +379,7 @@ class SpinQuant(TransformBase):
                     "into an independent parameter before fusing norms."
                 )
                 lm_head.weight = torch.nn.Parameter(lm_head.weight.data.clone())
+        hf_model.config.tie_word_embeddings = False
 
     def _apply_fused_ln(self):
         """Apply fused layer norm to a linear layer.

@@ -555,8 +555,6 @@ class QDQModule(torch.nn.Module):
                 # weight(bf16) -> fp8 -> int4
                 # dweight(int4) -> fp8 -> weight(bf16)
                 tensor_wise_scale = max_value_group_wise.max() / 448.0
-                # quant_weight, _ = quantize_weight_per_tensor_fp8(weight, tensor_wise_scale)
-                # new_weight_bf16 = quant_weight.to(torch.bfloat16) * tensor_wise_scale
                 new_weight_bf16 = weight
                 new_weight_bf16_qdq = fake_quant_dequant(
                     new_weight_bf16, method="groupwise", bits=4, group_size=group_size

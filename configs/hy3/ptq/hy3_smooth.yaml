@@ -1,0 +1,60 @@
+# HY3 Smooth 量化统一配置
+# Phase 1 入口: tools/run_vllm_smooth.py -c configs/hy3/ptq/hy3_smooth.yaml
+# Phase 2 入口: tools/convert_smooth_weights.py -c configs/hy3/ptq/hy3_smooth.yaml
+#
+# 两个脚本共享本文件，各自读取所需字段。
+# CLI 显式传参 > YAML 值 > argparse 默认值。
+
+# # ========== 路径（两阶段共用） ==========
+model_path: /path/to/model
+ptq_data_path: /path/to/dataset.jsonl
+output_dir: /path/to/smooth_output        # Phase 1 写入, Phase 2 读取
+save_path: /path/to/smoothed_model        # Phase 2 输出
+
+# ========== Phase 1: 模型加载 / 运行时 ==========
+tp_size: 16
+batch_size: 4
+num_samples: 16
+max_length: 16384
+distributed_executor_backend: ray
+skip_weight_loading: false
+verbose: false
+
+# ========== Phase 1: 收集范围 ==========
+collect_attn: true
+collect_down_proj: true
+collect_moe: true
+ema_momentum: 0.9
+
+# ========== Phase 2: Smooth 类型与 Alpha ==========
+smooth_qk: true
+smooth_vo: true
+smooth_down: true
+alpha_qk: 0.6
+alpha_vo: 0.5
+alpha_down: 0.6              # 无 alpha search 结果的 key 使用此值
+use_ema: false
+device: cpu
+dtype: auto
+
+# ========== Alpha Grid Search（Phase 1 执行, Phase 2 自动应用） ==========
+enable_alpha_search: true
+num_search_samples: 16
+search_max_length: 8192
+alpha_min: 0.3
+alpha_max: 1.0
+alpha_steps: 8
+alpha_act_quant_method: per_tensor
+alpha_act_quant_type: fp8
+alpha_weight_quant_method: per_tensor
+alpha_weight_quant_type: fp8
+alpha_weight_quant_bits: 8
+alpha_weight_group_size: 128
+alpha_max_tokens: 4096
+alpha_use_ema: false
+alpha_smooth_search_mode: default
+# per-tensor-act-first 模式参数（仅 mode=per-tensor-act-first 时生效）
+# alpha_act_mul_min: 0.1
+# alpha_act_mul_max: 1.0
+# alpha_smooth_min: 1e-6
+# alpha_smooth_max: 1e6

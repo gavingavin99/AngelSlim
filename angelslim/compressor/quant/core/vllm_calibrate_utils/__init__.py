@@ -42,6 +42,15 @@ from .hooks import (
     setup_kvcache_perhead_hooks,
     setup_kvcache_pertensor_hooks,
     setup_mtp_activation_hooks,
+    # Smooth stats
+    SmoothAttnHook,
+    SmoothDownProjInputHook,
+    collect_fused_moe_smooth_stats,
+    get_smooth_stats,
+    print_smooth_stats,
+    set_percentile_subsample,
+    get_percentile_subsample,
+    setup_smooth_hooks,
 )
 from .search import (
     KVCachePerHeadValueHook,
@@ -54,6 +63,13 @@ from .search import (
     remove_kvcache_perhead_value_hooks,
     setup_kvcache_perhead_value_hooks,
     setup_kvcache_value_hooks,
+    # Smooth alpha search
+    SmoothAlphaSearchConfig,
+    SmoothAlphaSearcher,
+    SmoothAlphaValueHook,
+    collect_fused_moe_alpha_search_values,
+    remove_smooth_alpha_search_hooks,
+    setup_smooth_alpha_search_hooks,
 )
 
 __all__ = [
@@ -96,4 +112,20 @@ __all__ = [
     "remove_kvcache_perhead_value_hooks",
     "KVScaleSearcherPerHead",
     "get_kv_scale_search_results_perhead",
+    # Smooth stats
+    "SmoothAttnHook",
+    "SmoothDownProjInputHook",
+    "setup_smooth_hooks",
+    "get_smooth_stats",
+    "print_smooth_stats",
+    "collect_fused_moe_smooth_stats",
+    "set_percentile_subsample",
+    "get_percentile_subsample",
+    # Smooth alpha search
+    "SmoothAlphaSearchConfig",
+    "SmoothAlphaValueHook",
+    "SmoothAlphaSearcher",
+    "setup_smooth_alpha_search_hooks",
+    "remove_smooth_alpha_search_hooks",
+    "collect_fused_moe_alpha_search_values",
 ]

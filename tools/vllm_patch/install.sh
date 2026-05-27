@@ -163,10 +163,38 @@ do_check() {
         ok=0
     fi
 
+    if grep -q "VLLM_MOE_COLLECT_SMOOTH_STATS" "${envs_dst}" 2>/dev/null; then
+        log "  [OK]   envs.py contains VLLM_MOE_COLLECT_SMOOTH_STATS"
+    else
+        err  "  [FAIL] envs.py does NOT contain VLLM_MOE_COLLECT_SMOOTH_STATS"
+        ok=0
+    fi
+
+    if grep -q "VLLM_MOE_COLLECT_ALPHA_SEARCH" "${envs_dst}" 2>/dev/null; then
+        log "  [OK]   envs.py contains VLLM_MOE_COLLECT_ALPHA_SEARCH"
+    else
+        err  "  [FAIL] envs.py does NOT contain VLLM_MOE_COLLECT_ALPHA_SEARCH"
+        ok=0
+    fi
+
     if grep -q "collect_fused_moe_internal_stats" "${fused_moe_dst}" 2>/dev/null; then
         log "  [OK]   fused_moe.py contains collect_fused_moe_internal_stats"
     else
         err  "  [FAIL] fused_moe.py does NOT contain collect_fused_moe_internal_stats"
+        ok=0
+    fi
+
+    if grep -q "collect_fused_moe_smooth_stats" "${fused_moe_dst}" 2>/dev/null; then
+        log "  [OK]   fused_moe.py contains collect_fused_moe_smooth_stats"
+    else
+        err  "  [FAIL] fused_moe.py does NOT contain collect_fused_moe_smooth_stats"
+        ok=0
+    fi
+
+    if grep -q "collect_fused_moe_alpha_search_values" "${fused_moe_dst}" 2>/dev/null; then
+        log "  [OK]   fused_moe.py contains collect_fused_moe_alpha_search_values"
+    else
+        err  "  [FAIL] fused_moe.py does NOT contain collect_fused_moe_alpha_search_values"
         ok=0
     fi
 

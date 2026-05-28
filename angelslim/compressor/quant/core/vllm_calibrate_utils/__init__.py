@@ -18,42 +18,56 @@ The vLLM ``fused_moe.py`` patch only imports
 re-exported via :mod:`.hooks`.
 """
 
-from .hooks import (
+from .hooks import (  # Smooth stats
     ActivationHook,
     KVCacheHook,
     KVCachePerHeadHook,
+    SmoothAttnHook,
+    SmoothDownProjInputHook,
     collect_fused_moe_internal_stats,
+    collect_fused_moe_smooth_stats,
     get_activation_stats,
     get_kvcache_only_stats,
     get_kvcache_perhead_stats,
     get_moe_stats,
     get_mtp_activation_stats,
     get_mtp_moe_stats,
+    get_percentile_subsample,
+    get_smooth_stats,
     print_activation_stats,
     print_kvcache_only_stats,
     print_kvcache_perhead_stats,
     print_moe_stats,
     print_mtp_activation_stats,
     print_mtp_moe_stats,
+    print_smooth_stats,
     remove_kvcache_only_hooks,
     remove_kvcache_perhead_hooks,
+    set_percentile_subsample,
     setup_activation_hooks,
     setup_kvcache_only_hooks,
     setup_kvcache_perhead_hooks,
     setup_kvcache_pertensor_hooks,
     setup_mtp_activation_hooks,
+    setup_smooth_hooks,
 )
-from .search import (
+from .search import (  # Smooth alpha search
     KVCachePerHeadValueHook,
     KVCacheValueHook,
     KVScaleSearcher,
     KVScaleSearcherPerHead,
+    SmoothAlphaSearchConfig,
+    SmoothAlphaSearcher,
+    SmoothAlphaValueHook,
+    collect_fused_moe_alpha_search_values,
     get_kv_scale_search_results,
     get_kv_scale_search_results_perhead,
     remove_kv_scale_search_hooks,
     remove_kvcache_perhead_value_hooks,
+    remove_smooth_alpha_search_hooks,
     setup_kvcache_perhead_value_hooks,
     setup_kvcache_value_hooks,
+    setup_smooth_alpha_search_hooks,
 )
 
 __all__ = [
@@ -96,4 +110,20 @@ __all__ = [
     "remove_kvcache_perhead_value_hooks",
     "KVScaleSearcherPerHead",
     "get_kv_scale_search_results_perhead",
+    # Smooth stats
+    "SmoothAttnHook",
+    "SmoothDownProjInputHook",
+    "setup_smooth_hooks",
+    "get_smooth_stats",
+    "print_smooth_stats",
+    "collect_fused_moe_smooth_stats",
+    "set_percentile_subsample",
+    "get_percentile_subsample",
+    # Smooth alpha search
+    "SmoothAlphaSearchConfig",
+    "SmoothAlphaValueHook",
+    "SmoothAlphaSearcher",
+    "setup_smooth_alpha_search_hooks",
+    "remove_smooth_alpha_search_hooks",
+    "collect_fused_moe_alpha_search_values",
 ]

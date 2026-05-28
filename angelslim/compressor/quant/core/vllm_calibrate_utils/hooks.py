@@ -57,6 +57,15 @@ __all__ = [
     "print_mtp_activation_stats",
     "get_mtp_moe_stats",
     "print_mtp_moe_stats",
+    # Smooth stats hooks
+    "SmoothAttnHook",
+    "SmoothDownProjInputHook",
+    "setup_smooth_hooks",
+    "get_smooth_stats",
+    "print_smooth_stats",
+    "collect_fused_moe_smooth_stats",
+    "set_percentile_subsample",
+    "get_percentile_subsample",
 ]
 
 
@@ -232,10 +241,6 @@ def setup_activation_hooks(model, kv_granularity="per-tensor"):
                 if hasattr(layer, "w13_weight") and layer.w13_weight is not None:
                     layer.w13_weight._vllm_layer_name = name
                     layer.w13_weight._moe_activation_stats_of_model = model._moe_activation_stats
-                    print(
-                        f"[DEBUG] Set w13_weight._vllm_layer_name = {name}, "
-                        f"type={type(layer.w13_weight)}"
-                    )
                 else:
                     print(
                         f"[DEBUG] Cannot set w13_weight._vllm_layer_name: "
@@ -1345,3 +1350,747 @@ def print_mtp_moe_stats(draft_model, verbose=False):
         print("[MTP] No MoE activation statistics available")
         return
     print_moe_stats(draft_model, verbose=verbose)
+
+
+# =============================================================================
+# Smooth Stats Hooks + Alpha Search
+# =============================================================================
+
+_SAMPLE_STRIDE = 683
+# Minimum samples we want to keep after stride-sampling.
+# numel <= _SAMPLE_STRIDE * _SAMPLE_MIN_KEEP → skip sampling (use full tensor).
+_SAMPLE_MIN_KEEP = 1024
+
+# --------------------------------------------------------------------------
+# External flag: enable / disable stride sub-sampling in percentile estimation.
+#
+# Three ways to control (in priority order at call-time):
+#   1. Python:   set_percentile_subsample(True / False)
+#                -- or --
+#                import vllm_calibrate_utils as U; U._SAMPLE_ENABLE = True
+#   2. Env var:  VLLM_CALIB_PERCENTILE_SUBSAMPLE=1   (enable)
+#                VLLM_CALIB_PERCENTILE_SUBSAMPLE=0   (disable)
+#                Read once at import time. Change via setter afterwards.
+#   3. Default:  True (sub-sampling ON — the fast path).
+#
+# Turn OFF when you need bit-exact percentile values and can pay the time;
+# turn ON (default) for ~stride-fold speed-up on large activations.
+# --------------------------------------------------------------------------
+_SAMPLE_ENABLE = os.getenv("VLLM_CALIB_PERCENTILE_SUBSAMPLE", "0") == "1"
+
+# --------------------------------------------------------------------------
+# Module-level cache for VLLM_MOE_COLLECT_SMOOTH_STATS flag.
+# collect_fused_moe_smooth_stats() is called from inside the vLLM FusedMoE
+# kernel on every forward pass (hot path), so we avoid os.getenv() overhead
+# by caching the flag here.  setup_smooth_hooks() updates this cache via
+# _set_moe_collect_smooth() when it enables collection at runtime.
+# --------------------------------------------------------------------------
+_MOE_COLLECT_SMOOTH = os.getenv("VLLM_MOE_COLLECT_SMOOTH_STATS", "0") == "1"
+
+
+def _set_moe_collect_smooth(enable: bool) -> None:
+    """Update the module-level MoE smooth-stats collection flag.
+
+    Called by :func:`setup_smooth_hooks` when it sets the env var at runtime,
+    so that :func:`collect_fused_moe_smooth_stats` (hot path) can skip the
+    ``os.getenv`` call and read the cached value instead.
+    """
+    global _MOE_COLLECT_SMOOTH
+    _MOE_COLLECT_SMOOTH = bool(enable)
+
+
+def set_percentile_subsample(enable: bool) -> None:
+    """Enable or disable stride sub-sampling for percentile estimation.
+
+    Affects :meth:`ActivationHook._percentile_min_max` and
+    :func:`_per_channel_absmax`. Takes effect on the next hook invocation
+    (safe to call between calibration batches).
+
+    Args:
+        enable: True to sub-sample (fast), False to use the full tensor (slow
+            but exact).
+    """
+    global _SAMPLE_ENABLE
+    _SAMPLE_ENABLE = bool(enable)
+
+
+def get_percentile_subsample() -> bool:
+    """Return the current sub-sampling flag."""
+    return _SAMPLE_ENABLE
+
+
+def _per_channel_absmax(tensor: torch.Tensor, token_clip: float = -1.0) -> torch.Tensor:
+    """Per-channel absmax over dim=0, with optional percentile clipping.
+
+    Args:
+        tensor: shape [num_tokens, dim] (1-D input is first unsqueezed to 2-D).
+        token_clip: clip mode for the per-channel statistic.
+            - <= 0 (default): return the absolute max of |tensor| along dim=0.
+            - In (0, 1]: treated as a quantile fraction (e.g. 0.999).
+            - In (1, 100): treated as a percentile value (e.g. 99.9).
+            When a percentile is given, return the q-th percentile of |tensor|
+            along dim=0 per channel. This suppresses outlier tokens while still
+            producing a per-channel [dim] vector compatible with SmoothQuant
+            scale calibration.
+
+    Implementation notes:
+        * Uses ``torch.topk(..., dim=0)`` instead of ``torch.kthvalue`` — much
+          faster on GPU when k is small (which is always true for tail
+          percentiles like 0.999).
+        * Sub-samples rows with a coprime stride (``_SAMPLE_STRIDE`` = 683)
+          when ``num_tokens`` is large. 683 is prime and coprime with all
+          common hidden_dims, so sampling is uniform across channels.
+        * Returns a CPU tensor to stay compatible with existing callers that
+          ``torch.maximum`` against CPU-resident running stats.
+
+    Returns:
+        CPU tensor of shape [dim].
+    """
+    if tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    abs_t = tensor.abs()
+
+    use_percentile = token_clip is not None and token_clip > 0
+    if not use_percentile:
+        return abs_t.max(dim=0).values.detach().cpu()
+
+    num_tokens = abs_t.shape[0]
+    if num_tokens == 0:
+        return abs_t.max(dim=0).values.detach().cpu()
+
+    # Normalise token_clip to a quantile fraction in (0, 1].
+    tc = float(token_clip)
+    q = tc if tc <= 1.0 else tc / 100.0
+    # Clamp to a sensible range to avoid degenerate indices.
+    q = max(0.5, min(q, 1.0 - 1e-6))
+
+    # topk requires a floating dtype; cast if needed.
+    if not abs_t.is_floating_point():
+        abs_t = abs_t.float()
+
+    # Stride-sample rows for very large token counts. Gated by the
+    # module-level flag (see set_percentile_subsample).
+    if _SAMPLE_ENABLE and num_tokens > _SAMPLE_STRIDE * _SAMPLE_MIN_KEEP:
+        abs_t = abs_t[::_SAMPLE_STRIDE]
+        num_tokens = abs_t.shape[0]
+
+    try:
+        # Short-circuit when the clipped tail is < 1 token per channel:
+        # topk(k=1, dim=0).values.min(0) == max(0), but plain reduction is
+        # much cheaper on GPU (no topk workspace / merge), so skip topk.
+        k_high_raw = int(round((1.0 - q) * num_tokens))
+        if k_high_raw <= 1:
+            return abs_t.max(dim=0).values.detach().cpu()
+
+        # topk along dim=0 takes the k_high largest per channel;
+        # the min of those k_high values ≈ q-th quantile of |x| per channel.
+        k_high = min(num_tokens, k_high_raw)
+        top = torch.topk(abs_t, k_high, dim=0, largest=True, sorted=False).values  # [k_high, dim]
+        return top.min(dim=0).values.detach().cpu()
+    except Exception as e:  # pragma: no cover - defensive fallback
+        print(
+            f"[_per_channel_absmax] token_clip topk failed (shape="
+            f"{tuple(abs_t.shape)}, q={q}): {e}. Fallback to absolute max."
+        )
+        return abs_t.max(dim=0).values.detach().cpu()
+
+
+class SmoothAttnHook:
+    """
+    Hook for collecting per-channel (last-dim) absmax and EMA statistics on:
+      - q, k inputs  to vllm.attention.layer.Attention (post-RoPE)
+      - attn output  from vllm.attention.layer.Attention
+        (= o_proj input, shape [num_tokens, num_heads * head_dim])
+
+    v is intentionally skipped.
+
+    EMA update rule:  ema = ema_momentum * ema + (1 - ema_momentum) * current_absmax
+
+    Args:
+        layer_name: Attention layer name.
+        smooth_stats: Shared dict that stores per-key running absmax/ema.
+        ema_momentum: EMA decay factor.
+        token_clip: Optional percentile-based clipping for the per-channel
+            absmax. See :func:`_per_channel_absmax` for the accepted values.
+            <=0 (default) preserves the original absolute-max behaviour.
+    """
+
+    def __init__(self, layer_name, smooth_stats, ema_momentum=0.9, token_clip=-1):
+        self.layer_name = layer_name
+        self.smooth_stats = smooth_stats
+        self.ema_momentum = ema_momentum
+        self.token_clip = token_clip
+        self.call_count = 0
+
+    def _update(self, key, tensor):
+        """Update absmax and EMA for a named tensor slot."""
+        with torch.no_grad():
+            # tensor: [num_tokens, dim]  (vLLM flattens batch into tokens)
+            # per-channel absmax (or percentile when token_clip>0) over tokens
+            cur_absmax = _per_channel_absmax(tensor, token_clip=self.token_clip)  # [dim]
+
+            stats = self.smooth_stats[key]
+            # absmax: running maximum
+            if stats["absmax"] is None:
+                stats["absmax"] = cur_absmax
+            else:
+                stats["absmax"] = torch.maximum(stats["absmax"], cur_absmax)
+            # ema: exponential moving average of per-channel absmax
+            if stats["ema"] is None:
+                stats["ema"] = cur_absmax.clone()
+            else:
+                stats["ema"] = (
+                    self.ema_momentum * stats["ema"] + (1.0 - self.ema_momentum) * cur_absmax
+                )
+            stats["call_count"] = self.call_count
+
+    def __call__(self, module, input, output):
+        self.call_count += 1
+        # --- inputs: q, k (v skipped) ---
+        q = input[0] if len(input) > 0 else None
+        k = input[1] if len(input) > 1 else None
+        for tag, tensor in [("q", q), ("k", k)]:
+            if tensor is not None and isinstance(tensor, torch.Tensor):
+                self._update(f"{self.layer_name}.{tag}", tensor)
+        # --- output: attention result = o_proj input ---
+        attn_out = output[0] if isinstance(output, tuple) else output
+        if attn_out is not None and isinstance(attn_out, torch.Tensor):
+            self._update(f"{self.layer_name}.attn_out", attn_out)
+
+
+class SmoothDownProjInputHook:
+    """
+    Hook for collecting per-channel (last-dim) absmax and EMA statistics
+    on the INPUT of the MLP down_proj layer.
+
+    This captures silu(gate) * up, which is the true activation that
+    down_proj sees — the correct signal for SmoothQuant scale calibration.
+
+    Input shape: [num_tokens, intermediate_size]
+
+    EMA update rule:  ema = ema_momentum * ema + (1 - ema_momentum) * current_absmax
+
+    Args:
+        layer_name: down_proj layer name.
+        smooth_stats: Shared dict that stores per-layer running absmax/ema.
+        ema_momentum: EMA decay factor.
+        token_clip: Optional percentile-based clipping for the per-channel
+            absmax. See :func:`_per_channel_absmax` for the accepted values.
+            <=0 (default) preserves the original absolute-max behaviour.
+    """
+
+    def __init__(self, layer_name, smooth_stats, ema_momentum=0.9, token_clip=-1):
+        self.layer_name = layer_name
+        self.smooth_stats = smooth_stats
+        self.ema_momentum = ema_momentum
+        self.token_clip = token_clip
+        self.call_count = 0
+
+    def __call__(self, module, input, output):
+        self.call_count += 1
+        # input to down_proj is a tuple; first element is the activation tensor
+        act = input[0] if isinstance(input, tuple) else input
+        if not isinstance(act, torch.Tensor):
+            return
+
+        with torch.no_grad():
+            # per-channel absmax (or percentile when token_clip>0): [intermediate_size]
+            cur_absmax = _per_channel_absmax(act, token_clip=self.token_clip)
+
+            stats = self.smooth_stats[self.layer_name]
+            if stats["absmax"] is None:
+                stats["absmax"] = cur_absmax
+            else:
+                stats["absmax"] = torch.maximum(stats["absmax"], cur_absmax)
+            if stats["ema"] is None:
+                stats["ema"] = cur_absmax.clone()
+            else:
+                stats["ema"] = (
+                    self.ema_momentum * stats["ema"] + (1.0 - self.ema_momentum) * cur_absmax
+                )
+            stats["call_count"] = self.call_count
+
+
+def setup_smooth_hooks(
+    model,
+    ema_momentum=0.9,
+    collect_attn=True,
+    collect_down_proj=True,
+    collect_moe=True,
+    token_clip=-1,
+):
+    """
+    Register smooth hooks on the model to collect per-channel absmax and EMA stats.
+
+    Args:
+        model: The nn.Module model instance (called inside llm.apply_model).
+        ema_momentum: EMA decay factor (default 0.9).
+        collect_attn: If True, register hooks on vllm.attention.layer.Attention to
+                      collect q / k inputs and attn output (= o_proj input).
+        collect_down_proj: If True, register hooks on dense MLP down_proj layers to
+                           collect silu(gate)*up (the true down_proj input).
+        collect_moe: If True, wire FusedMoE layers for kernel-injected smooth stats.
+                     Requires VLLM_MOE_COLLECT_SMOOTH_STATS=1 env var AND the
+                     corresponding call to collect_fused_moe_smooth_stats() inside
+                     the vLLM FusedMoE kernel source.
+        token_clip: Optional percentile-based clipping for per-channel absmax
+                    collection in SmoothAttnHook / SmoothDownProjInputHook.
+                    - <= 0 (default): disabled, use absolute max (original behaviour).
+                    - In (0, 1]: quantile fraction (e.g. 0.999).
+                    - In (1, 100): percentile value (e.g. 99.9).
+                    A high percentile suppresses outlier tokens during calibration.
+                    Does NOT affect MoE kernel-injected stats (those go through
+                    collect_fused_moe_smooth_stats and are unchanged).
+
+    Statistics are stored in model._smooth_stats:
+      {
+        "<attn_layer>.q":        {"absmax": Tensor, "ema": Tensor, "call_count": int},
+        "<attn_layer>.k":        {...},
+        "<attn_layer>.attn_out": {...},   # = o_proj input
+        "<down_proj_layer>":     {"absmax": Tensor, "ema": Tensor, "call_count": int},
+        "<moe_layer>.down_proj": {"absmax": Tensor, "ema": Tensor, "call_count": int},
+      }
+
+    Returns a summary string (compatible with llm.apply_model return protocol).
+    """
+    try:
+        # vLLM ≥ 0.20 (Tencent custom): Attention moved under model_executor.
+        from vllm.model_executor.layers.attention import Attention
+    except ImportError:
+        # Older vLLM layout.
+        from vllm.attention.layer import Attention
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+    from vllm.model_executor.layers.linear import LinearBase
+
+    # ------------------------------------------------------------------
+    # 1. Discover layers for each requested scope
+    # ------------------------------------------------------------------
+    attn_layers = _find_layers(model, layers=[Attention]) if collect_attn else {}
+    down_proj_layers = {}
+    if collect_down_proj:
+        all_linear = _find_layers(model, layers=[torch.nn.Linear, LinearBase])
+        down_proj_layers = {
+            name: module
+            for name, module in all_linear.items()
+            if name.split(".")[-1] == "down_proj"
+        }
+    moe_layers = _find_layers(model, layers=[FusedMoE]) if collect_moe else {}
+
+    # ------------------------------------------------------------------
+    # EP (Expert Parallelism) check: smooth stat collection is NOT
+    # compatible with EP because each rank only holds a subset of experts,
+    # so per-channel stats are gathered over different token sets on
+    # different ranks.  all_gather in get_smooth_stats only handles the
+    # TP intermediate-size shard dimension; it cannot reconstruct stats
+    # that are split by expert assignment.  Abort early to prevent silent
+    # wrong results.
+    # ------------------------------------------------------------------
+    if collect_moe and moe_layers:
+        os.environ["VLLM_MOE_COLLECT_SMOOTH_STATS"] = "1"
+        _set_moe_collect_smooth(True)  # keep module-level cache in sync
+        ep_layers = {
+            name: layer
+            for name, layer in moe_layers.items()
+            if getattr(layer, "use_ep", False) and getattr(layer, "ep_size", 1) > 1
+        }
+        if ep_layers:
+            ep_example = next(iter(ep_layers))
+            ep_size = getattr(ep_layers[ep_example], "ep_size", "?")
+            raise RuntimeError(
+                f"[setup_smooth_hooks] Expert Parallelism (EP) is NOT supported for "
+                f"smooth stat calibration. Detected {len(ep_layers)} FusedMoE layer(s) "
+                f"with ep_size={ep_size} (e.g. '{ep_example}'). "
+                f"Please re-run calibration with pure TP (set ep_size=1 / "
+                f"disable expert parallelism)."
+            )
+
+    collect_moe_smooth = collect_moe and os.getenv("VLLM_MOE_COLLECT_SMOOTH_STATS", "0") == "1"
+
+    print(
+        f"---------Smooth hooks scope: "
+        f"attn={'ON' if collect_attn else 'OFF'} ({len(attn_layers)} layers), "
+        f"down_proj={'ON' if collect_down_proj else 'OFF'} ({len(down_proj_layers)} layers), "
+        f"moe={'ON' if collect_moe else 'OFF'} ({len(moe_layers)} layers, "
+        f"kernel_inject={'ON' if collect_moe_smooth else 'OFF'})---------"
+    )
+    if collect_moe and moe_layers and not collect_moe_smooth:
+        print(
+            "---------[WARNING] MoE scope enabled but VLLM_MOE_COLLECT_SMOOTH_STATS"
+            " is not set to 1 — MoE stats will NOT be collected---------"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Initialise stats storage
+    # ------------------------------------------------------------------
+    if not hasattr(model, "_smooth_stats"):
+        model._smooth_stats = {}
+    # Metadata dict: key → gather strategy info
+    # Used by get_smooth_stats to handle GQA + TP correctly.
+    if not hasattr(model, "_smooth_stats_meta"):
+        model._smooth_stats_meta = {}
+
+    for name, _attn_module in attn_layers.items():
+        # Try to read kv_head replica count from the qkv_proj inside the
+        # parent LlamaAttention (or equivalent). The Attention module itself
+        # doesn't hold this, but its sibling qkv_proj does.
+        # We walk up one level to find it.
+        kv_replicas = 1
+        try:
+            from vllm.model_executor.layers.linear import QKVParallelLinear
+
+            parent_name = ".".join(name.split(".")[:-1])  # drop ".attn" suffix
+            parent = model
+            for part in parent_name.split("."):
+                parent = getattr(parent, part)
+            qkv_proj = getattr(parent, "qkv_proj", None)
+            if isinstance(qkv_proj, QKVParallelLinear):
+                kv_replicas = qkv_proj.num_kv_head_replicas
+        except Exception:
+            pass
+
+        for tag in ("q", "k", "attn_out"):
+            key = f"{name}.{tag}"
+            if key not in model._smooth_stats:
+                model._smooth_stats[key] = {"absmax": None, "ema": None, "call_count": 0}
+            # k (and v if we ever add it) may have replicas across TP ranks
+            model._smooth_stats_meta[key] = {
+                "kv_replicas": kv_replicas if tag == "k" else 1,
+            }
+
+    for name in down_proj_layers:
+        if name not in model._smooth_stats:
+            model._smooth_stats[name] = {"absmax": None, "ema": None, "call_count": 0}
+
+    if collect_moe_smooth:
+        for name, layer in moe_layers.items():
+            num_experts = getattr(layer, "global_num_experts", None) or getattr(
+                layer, "local_num_experts", None
+            )
+            if num_experts is None:
+                print(
+                    f"[WARNING] Cannot determine num_experts for {name}, skipping pre-allocation"
+                )
+                continue
+            for expert_id in range(num_experts):
+                key = f"{name}.{expert_id}.down_proj"
+                if key not in model._smooth_stats:
+                    model._smooth_stats[key] = {"absmax": None, "ema": None, "call_count": 0}
+
+    # ------------------------------------------------------------------
+    # 3. Register PyTorch forward hooks (idempotent guard)
+    # ------------------------------------------------------------------
+    if not hasattr(model, "_smooth_hooks"):
+        model._smooth_hooks = []
+
+        for name, layer in attn_layers.items():
+            hook = SmoothAttnHook(
+                name,
+                model._smooth_stats,
+                ema_momentum=ema_momentum,
+                token_clip=token_clip,
+            )
+            handle = layer.register_forward_hook(hook)
+            model._smooth_hooks.append(handle)
+
+        for name, layer in down_proj_layers.items():
+            hook = SmoothDownProjInputHook(
+                name,
+                model._smooth_stats,
+                ema_momentum=ema_momentum,
+                token_clip=token_clip,
+            )
+            handle = layer.register_forward_hook(hook)
+            model._smooth_hooks.append(handle)
+
+    # ------------------------------------------------------------------
+    # 4. Wire FusedMoE layers for kernel-injected smooth stats
+    # ------------------------------------------------------------------
+    if collect_moe_smooth:
+        for name, layer in moe_layers.items():
+            if hasattr(layer, "w13_weight") and layer.w13_weight is not None:
+                layer.w13_weight._vllm_layer_name_smooth = name
+                layer.w13_weight._smooth_stats_of_model = model._smooth_stats
+                layer.w13_weight._smooth_ema_momentum = ema_momentum
+                # print(f"[DEBUG] Set w13_weight._vllm_layer_name_smooth = {name}")
+            else:
+                print(
+                    f"[DEBUG] Cannot set smooth attrs on w13_weight for {name}: "
+                    f"hasattr={hasattr(layer, 'w13_weight')}, "
+                    f"is_none={getattr(layer, 'w13_weight', None) is None}"
+                )
+
+    print(f"---------Smooth hooks registered: {len(model._smooth_hooks)} total---------")
+    return f"Registered {len(model._smooth_hooks)} smooth hooks"
+
+
+def get_smooth_stats(model):
+    """
+    Retrieve smooth statistics from the model.
+    Performs all-reduce (MAX for absmax, mean for ema) across all workers.
+
+    Returns a serialisable dict:
+      {
+        "<key>": {"absmax": [float, ...], "ema": [float, ...]},
+        ...
+      }
+
+    TP-aware gather (unchanged semantics):
+        Each rank holds one shard of the full channel dimension.
+        For k under GQA+TP (kv_replicas > 1), only every kv_replicas-th
+        rank carries a unique shard — the rest are duplicates and are skipped.
+        setup_smooth_hooks() raises RuntimeError for EP, so EP never reaches here.
+
+    Performance optimisation over the naïve per-key loop:
+        The original implementation issued one ``dist.all_gather`` call per key
+        for absmax and one for ema, resulting in O(N) collective round-trips
+        (N = number of stat keys).  For a large MoE model this can be thousands
+        of calls (e.g. 60 layers × 64 experts = 3 840 expert keys alone), each
+        paying the fixed NCCL launch latency.
+
+        The optimised version groups keys by ``(tensor_size, kv_replicas)``.
+        Keys in the same group are stacked into a 2-D tensor and gathered in
+        **one** ``dist.all_gather`` call.  The whole-group result is moved to CPU
+        in a single transfer.  Typical groups for a Transformer model:
+          • (hidden_dim // TP, 1)              — q, attn_out, dense down_proj
+          • (kv_head_dim // TP, kv_replicas)   — k (GQA)
+          • (intermediate_dim // TP, 1)        — all MoE expert down_proj keys
+        → 2–4 ``all_gather`` calls total, regardless of layer / expert count.
+        This reduces wall-clock time from O(N) collective round-trips to O(S)
+        where S ≪ N (typically minutes → seconds on large MoE models).
+    """
+    if not hasattr(model, "_smooth_stats"):
+        return None
+
+    from collections import defaultdict
+
+    import torch.distributed as dist
+
+    rank, world_size = _get_dist_info()
+
+    # ------------------------------------------------------------------
+    # TP-aware gather: each rank holds a shard of the full channel dim.
+    #
+    # For q / attn_out / down_proj / MoE (pure TP only):
+    #   Each rank has a *unique* shard → all_gather + cat gives full dim.
+    #
+    # NOTE: EP (Expert Parallelism) is NOT supported here.  With EP each
+    # rank owns a different subset of experts and processes different
+    # tokens, so a simple all_gather + cat would produce wrong channel
+    # ordering / shape.  setup_smooth_hooks() already raises RuntimeError
+    # when EP is detected, so we should never reach this point with EP.
+    #
+    # For k (GQA + TP where tp > kv_heads):
+    #   num_kv_head_replicas > 1, meaning consecutive ranks share the *same*
+    #   kv head shard. e.g. tp=16, kv_heads=8 → replicas=2, so rank0 and
+    #   rank1 both hold kv_head_0; rank2 and rank3 hold kv_head_1; etc.
+    #   We must only collect one copy per unique shard, i.e. every
+    #   `kv_replicas`-th rank, to avoid duplicating channels.
+    # ------------------------------------------------------------------
+    if world_size > 1 and dist.is_initialized():
+        meta = getattr(model, "_smooth_stats_meta", {})
+
+        # --------------------------------------------------------------
+        # Batched all_gather: group keys by (tensor_size, kv_replicas)
+        # so that each group needs only ONE all_gather call.
+        #
+        # Typical groups for a Transformer model (2-4 total):
+        #   (hidden_dim // TP, 1)            — q, attn_out, dense down_proj
+        #   (kv_head_dim // TP, kv_replicas) — k (GQA)
+        #   (intermediate_dim // TP, 1)      — all MoE expert down_proj
+        # This reduces O(N) NCCL round-trips to O(S) where S ≪ N.
+        # --------------------------------------------------------------
+
+        # Step 1: group keys by (tensor_size, kv_replicas)
+        groups = defaultdict(list)  # (size, kv_reps) -> [(key, has_ema), ...]
+        for key, stats in model._smooth_stats.items():
+            if stats["absmax"] is None:
+                continue
+            kv_replicas = meta.get(key, {}).get("kv_replicas", 1)
+            size = stats["absmax"].shape[0]
+            has_ema = stats["ema"] is not None
+            groups[(size, kv_replicas)].append((key, has_ema))
+
+        # Step 2: per-group batched all_gather
+        for (_size, kv_replicas), keys_info in groups.items():
+            # Build a stacked 2-D tensor: each key contributes 1 row
+            # (absmax) or 2 rows (absmax + ema).
+            rows = []
+            row_map = []  # tracks (key, field) for each row
+            for key, has_ema in keys_info:
+                rows.append(model._smooth_stats[key]["absmax"])
+                row_map.append((key, "absmax"))
+                if has_ema:
+                    rows.append(model._smooth_stats[key]["ema"])
+                    row_map.append((key, "ema"))
+
+            # Single H2D transfer for the whole group
+            stacked = torch.stack(rows, dim=0).cuda()  # [num_rows, size]
+
+            # Single buffer allocation for the whole group
+            gathered = [torch.zeros_like(stacked) for _ in range(world_size)]
+
+            # ★ ONE all_gather for the entire group ★
+            dist.all_gather(gathered, stacked)
+
+            # De-duplicate replicated shards (GQA k heads)
+            unique = gathered[::kv_replicas]  # list of [num_rows, size]
+
+            # Single D2H transfer: concat along channel dim, move to CPU
+            full = torch.cat(unique, dim=1).cpu()  # [num_rows, full_size]
+
+            # Scatter results back to individual stats entries
+            for i, (key, field) in enumerate(row_map):
+                model._smooth_stats[key][field] = full[i]
+
+            del stacked, gathered, full
+
+    # ------------------------------------------------------------------
+    # Serialise to plain Python lists (JSON-friendly)
+    # ------------------------------------------------------------------
+    result = {}
+    for key, stats in model._smooth_stats.items():
+        result[key] = {
+            "absmax": stats["absmax"].tolist() if stats["absmax"] is not None else None,
+            "ema": stats["ema"].tolist() if stats["ema"] is not None else None,
+            "call_count": stats.get("call_count", 0),
+        }
+    return result
+
+
+def print_smooth_stats(model, max_rows=20):
+    """
+    Pretty-print smooth statistics (per-channel absmax/ema summary).
+    Only prints on rank 0.
+    """
+    if not hasattr(model, "_smooth_stats"):
+        print("No smooth statistics available")
+        return
+
+    rank, _ = _get_dist_info()
+    if rank != 0:
+        return
+
+    print("\n" + "=" * 90)
+    print("Smooth Statistics  (per-channel absmax / ema — showing scalar max over channels)")
+    print("=" * 90)
+    rows = 0
+    for key, stats in model._smooth_stats.items():
+        if stats["absmax"] is None:
+            absmax_repr = "N/A"
+            ema_repr = "N/A"
+        else:
+            absmax_repr = f"{stats['absmax'].max().item():.6f}"
+            ema_repr = f"{stats['ema'].max().item():.6f}" if stats["ema"] is not None else "N/A"
+        print(
+            f"{key:70s} | absmax_max: {absmax_repr:>12} | ema_max: {ema_repr:>12}"
+            f" | calls: {stats.get('call_count', 0):4d}"
+        )
+        rows += 1
+        if rows >= max_rows:
+            remaining = len(model._smooth_stats) - max_rows
+            if remaining > 0:
+                print(f"  ... and {remaining} more entries (use get_smooth_stats() for full data)")
+            break
+    print("=" * 90 + "\n")
+
+
+def collect_fused_moe_smooth_stats(
+    stage,
+    hidden_states,
+    topk_ids,
+    layer_name=None,
+    global_smooth_stats=None,
+    ema_momentum=0.9,
+):
+    """
+    Collect per-channel absmax and EMA statistics for FusedMoE internal activations.
+    Mirrors collect_fused_moe_internal_stats but records per-channel vectors instead of
+    scalar min/max, for use with SmoothQuant scale calibration.
+
+    Must be called from within the vLLM FusedMoE kernel (requires vLLM source modification),
+    at the point where hidden_states is the input to w2 (down_proj), i.e. after
+    gate_up matmul + silu activation.
+
+    Args:
+        stage: "down_proj" (gate_up stage is not used for smooth, only down_proj input)
+        hidden_states: Input tensor to down_proj, shape [num_tokens * top_k, intermediate_size]
+        topk_ids: Expert assignment tensor [num_tokens, top_k], used to filter out padding
+                  tokens (expert_id == -1) introduced by variable top_k / expert parallelism.
+        layer_name: FusedMoE layer name (passed via w13_weight._vllm_layer_name_smooth)
+        global_smooth_stats: The model._smooth_stats dict
+                             (passed via w13_weight._smooth_stats_of_model)
+        ema_momentum: EMA decay factor (passed via w13_weight._smooth_ema_momentum)
+
+    """
+    if global_smooth_stats is None or layer_name is None:
+        return
+    if stage != "down_proj":
+        return  # Only down_proj input is needed for smooth stats
+
+    with torch.no_grad():
+        act = hidden_states
+        if act.dim() == 1:
+            act = act.unsqueeze(0)
+
+        # Resolve flat_expert_ids and flat_hidden.
+        # hidden_states shape: [num_tokens * top_k, intermediate_size]
+        # topk_ids shape:      [num_tokens, top_k]
+        num_tokens_hs = act.shape[0]
+        num_tokens_topk = topk_ids.shape[0]
+        top_k = topk_ids.shape[1]
+
+        if num_tokens_hs == num_tokens_topk * top_k:
+            flat_expert_ids = topk_ids.reshape(-1)  # [num_tokens * top_k]
+        else:
+            # Shape mismatch — fall back to layer-level (no per-expert breakdown)
+            flat_expert_ids = None
+
+        if flat_expert_ids is not None:
+            # --- Per-expert stats ---
+            unique_experts = flat_expert_ids.unique()
+            for expert_id_tensor in unique_experts:
+                expert_id = expert_id_tensor.item()
+                if expert_id < 0:
+                    continue  # Skip padding tokens (expert_id == -1)
+                expert_key = f"{layer_name}.{expert_id}.down_proj"
+                # Dynamically create entry if not pre-allocated
+                if expert_key not in global_smooth_stats:
+                    global_smooth_stats[expert_key] = {
+                        "absmax": None,
+                        "ema": None,
+                        "call_count": 0,
+                    }
+                mask = flat_expert_ids == expert_id_tensor
+                expert_hidden = act[mask]
+                if expert_hidden.numel() == 0:
+                    continue
+                cur_absmax = expert_hidden.abs().max(dim=0).values.detach().cpu()
+                stats = global_smooth_stats[expert_key]
+                if stats["absmax"] is None:
+                    stats["absmax"] = cur_absmax
+                else:
+                    stats["absmax"] = torch.maximum(stats["absmax"], cur_absmax)
+                if stats["ema"] is None:
+                    stats["ema"] = cur_absmax.clone()
+                else:
+                    stats["ema"] = ema_momentum * stats["ema"] + (1.0 - ema_momentum) * cur_absmax
+                stats["call_count"] = stats.get("call_count", 0) + 1
+        else:
+            # Fallback: shape mismatch, collect layer-level stats without per-expert split
+            valid_act = act  # cannot filter without expert ids
+            if valid_act.numel() == 0:
+                return
+            fallback_key = f"{layer_name}.down_proj"
+            if fallback_key not in global_smooth_stats:
+                global_smooth_stats[fallback_key] = {"absmax": None, "ema": None, "call_count": 0}
+            cur_absmax = valid_act.abs().max(dim=0).values.detach().cpu()
+            stats = global_smooth_stats[fallback_key]
+            if stats["absmax"] is None:
+                stats["absmax"] = cur_absmax
+            else:
+                stats["absmax"] = torch.maximum(stats["absmax"], cur_absmax)
+            if stats["ema"] is None:
+                stats["ema"] = cur_absmax.clone()
+            else:
+                stats["ema"] = ema_momentum * stats["ema"] + (1.0 - ema_momentum) * cur_absmax
+            stats["call_count"] = stats.get("call_count", 0) + 1

@@ -32,8 +32,8 @@ import platform
 
 from vllm import LLM, SamplingParams
 
-from angelslim.compressor.quant import (
-    SmoothAlphaSearchConfig,
+from angelslim.compressor.transform.smooth.config import SmoothAlphaSearchConfig
+from angelslim.compressor.transform.smooth.vllm import (
     SmoothAlphaSearcher,
     get_smooth_stats,
     print_smooth_stats,
@@ -633,6 +633,10 @@ def main():
         print("=" * 80)
 
         # ------ Phase D search ------
+        # Note: args.alpha_max_tokens is the per-layer raw-tensor cap used
+        # at hook-registration time (see L620 above for setup_smooth_alpha_
+        # search_hooks); it does NOT belong on SmoothAlphaSearchConfig — the
+        # searcher consumes whatever tokens were already captured by the hooks.
         alpha_config = SmoothAlphaSearchConfig(
             alpha_min=args.alpha_min,
             alpha_max=args.alpha_max,
@@ -643,7 +647,6 @@ def main():
             weight_quant_type=args.alpha_weight_quant_type,
             weight_quant_bits=args.alpha_weight_quant_bits,
             weight_group_size=args.alpha_weight_group_size,
-            max_tokens_per_layer=args.alpha_max_tokens,
             use_ema_for_absmax=args.alpha_use_ema,
             smooth_search_mode=args.alpha_smooth_search_mode,
             act_mul_min=args.alpha_act_mul_min,

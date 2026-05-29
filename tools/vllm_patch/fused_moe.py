@@ -53,8 +53,12 @@ except ImportError as _e:
 
 
 # Import smooth stats and alpha search collection functions.
+# These live in their own module (smooth_moe_inject) installed by the
+# vllm_patch installer at <vllm>/tools/smooth_moe_inject.py.  Keeping
+# them out of vllm_calibrate_utils means the smooth pipeline can ship
+# independently of the activation/KV calibration utilities.
 try:
-    from vllm_calibrate_utils import collect_fused_moe_smooth_stats  # noqa: E402
+    from smooth_moe_inject import collect_fused_moe_smooth_stats  # noqa: E402
 
     _angelslim_logger.info("[AngelSlim] Successfully imported collect_fused_moe_smooth_stats")
 except ImportError:
@@ -65,7 +69,7 @@ except ImportError:
 
 
 try:
-    from vllm_calibrate_utils import collect_fused_moe_alpha_search_values  # noqa: E402
+    from smooth_moe_inject import collect_fused_moe_alpha_search_values  # noqa: E402
 
     _angelslim_logger.info(
         "[AngelSlim] Successfully imported collect_fused_moe_alpha_search_values"

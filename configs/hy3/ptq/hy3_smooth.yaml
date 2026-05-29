@@ -1,17 +1,17 @@
-# HY3 Smooth 量化统一配置
-# Phase 1 入口: tools/run_vllm_smooth.py -c configs/hy3/ptq/hy3_smooth.yaml
-# Phase 2 入口: tools/convert_smooth_weights.py -c configs/hy3/ptq/hy3_smooth.yaml
+# HY3 SmoothQuant unified config (shared by Phase 1 and Phase 2)
+# Phase 1 entry: tools/run_vllm_smooth.py        -c configs/hy3/ptq/hy3_smooth.yaml
+# Phase 2 entry: tools/convert_smooth_weights.py -c configs/hy3/ptq/hy3_smooth.yaml
 #
-# 两个脚本共享本文件，各自读取所需字段。
-# CLI 显式传参 > YAML 值 > argparse 默认值。
+# Both scripts read from this single file, picking up only the fields they need.
+# Override priority: explicit CLI flag > YAML value > argparse default.
 
-# # ========== 路径（两阶段共用） ==========
+# ========== Paths (shared by both phases) ==========
 model_path: /path/to/model
 ptq_data_path: /path/to/dataset.jsonl
-output_dir: /path/to/smooth_output        # Phase 1 写入, Phase 2 读取
-save_path: /path/to/smoothed_model        # Phase 2 输出
+output_dir: /path/to/smooth_output        # Phase 1 writes here; Phase 2 reads from here
+save_path: /path/to/smoothed_model        # Phase 2 output
 
-# ========== Phase 1: 模型加载 / 运行时 ==========
+# ========== Phase 1: model loading / runtime ==========
 tp_size: 16
 batch_size: 4
 num_samples: 16
@@ -20,24 +20,24 @@ distributed_executor_backend: ray
 skip_weight_loading: false
 verbose: false
 
-# ========== Phase 1: 收集范围 ==========
+# ========== Phase 1: collection scope ==========
 collect_attn: true
 collect_down_proj: true
 collect_moe: true
 ema_momentum: 0.9
 
-# ========== Phase 2: Smooth 类型与 Alpha ==========
+# ========== Phase 2: smooth flavours & fixed alpha ==========
 smooth_qk: true
 smooth_vo: true
 smooth_down: true
 alpha_qk: 0.6
 alpha_vo: 0.5
-alpha_down: 0.6              # 无 alpha search 结果的 key 使用此值
+alpha_down: 0.6              # fallback alpha for keys not covered by alpha search
 use_ema: false
 device: cpu
 dtype: auto
 
-# ========== Alpha Grid Search（Phase 1 执行, Phase 2 自动应用） ==========
+# ========== Alpha grid search (run in Phase 1, applied in Phase 2) ==========
 enable_alpha_search: true
 num_search_samples: 16
 search_max_length: 8192
@@ -53,7 +53,7 @@ alpha_weight_group_size: 128
 alpha_max_tokens: 4096
 alpha_use_ema: false
 alpha_smooth_search_mode: default
-# per-tensor-act-first 模式参数（仅 mode=per-tensor-act-first 时生效）
+# per-tensor-act-first mode parameters (only effective when mode=per-tensor-act-first)
 # alpha_act_mul_min: 0.1
 # alpha_act_mul_max: 1.0
 # alpha_smooth_min: 1e-6

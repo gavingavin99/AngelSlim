@@ -19,18 +19,21 @@ Re-exports the public API used by:
 * the patched ``vllm/tools/smooth_moe_inject.py`` (FusedMoE kernel hook)
 """
 
-from .hooks import SmoothAlphaValueHook, SmoothAttnHook, SmoothDownProjInputHook
+from .hooks import (
+    SmoothAlphaValueHook,
+    SmoothAttnHook,
+    SmoothDownProjInputHook,
+    get_smooth_stats,
+    print_smooth_stats,
+    remove_smooth_alpha_search_hooks,
+    setup_smooth_alpha_search_hooks,
+    setup_smooth_hooks,
+)
 from .moe_inject import (
     collect_fused_moe_alpha_search_values,
     collect_fused_moe_smooth_stats,
 )
 from .searcher_dist import SmoothAlphaSearcher
-from .setup import (
-    remove_smooth_alpha_search_hooks,
-    setup_smooth_alpha_search_hooks,
-    setup_smooth_hooks,
-)
-from .stats_collector import get_smooth_stats, print_smooth_stats
 
 __all__ = [
     # Hook classes

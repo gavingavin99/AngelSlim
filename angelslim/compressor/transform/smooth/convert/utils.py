@@ -12,15 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pre/post-transform forward snapshot & numerical verification.
+"""Shared utilities for the offline (HuggingFace-side) weight converter.
 
-Two flavours:
-* attention-level — :func:`snapshot_attn_output_before` records the
-  output of the first attention module and
-  :func:`verify_attn_output_diff` re-runs it after the smooth transform
-  and prints the difference.
-* MLP-level — :func:`snapshot_mlp_outputs_before` /
-  :func:`verify_mlp_output_diff` do the same for MLP containers.
+This module bundles three concerns:
+
+* **Per-architecture key maps** — each ``KEY_MAP`` specifies attribute
+  names for projections (``q_proj``, ``k_proj``, ...), the smooth-stats
+  key suffixes captured by the vLLM hooks (``.q``, ``.k``, ``.attn_out``,
+  ...), regex patterns for discovering ``down_proj`` stats and MLP
+  containers, and — for fused MoE architectures — the names of the 3-D
+  ``down_proj`` / ``gate_up_proj`` parameters.
+* **Module-discovery helpers** — name-based submodule lookup, meta-device
+  weight materialisation, and vLLM-stat-key -> HuggingFace-path translation.
+* **Snapshot / verify helpers** — record attention and MLP forward
+  outputs before the smooth transform so they can be compared afterwards.
 """
 
 import contextlib
@@ -29,10 +34,18 @@ import re
 
 import torch
 
-from .key_maps import DEFAULT_KEY_MAP
-from .module_finder import attn_key_to_hf_prefix, get_submodule_safe
-
 __all__ = [
+    # KEY_MAPS
+    "HY_V3_KEY_MAP",
+    "LLAMA_KEY_MAP",
+    "MIXTRAL_KEY_MAP",
+    "QWEN3_MOE_KEY_MAP",
+    "PREDEFINED_KEY_MAPS",
+    "DEFAULT_KEY_MAP",
+    # utils
+    "get_submodule_safe",
+    "maybe_materialize",
+    "attn_key_to_hf_prefix",
     "find_first_attn_module",
     "snapshot_attn_output_before",
     "verify_attn_output_diff",
@@ -41,9 +54,207 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Per-architecture key maps
+# ===========================================================================
+
+
+HY_V3_KEY_MAP = {
+    # projection attribute names
+    "q_proj": "q_proj",
+    "k_proj": "k_proj",
+    "v_proj": "v_proj",
+    "o_proj": "o_proj",
+    "down_proj": "down_proj",
+    "up_proj": "up_proj",
+    # qk_norm
+    "qk_norm_flag": "use_qk_norm",
+    "q_norm": "q_norm",
+    "k_norm": "k_norm",
+    # stats key suffixes
+    "stat_k": ".k",
+    "stat_q": ".q",
+    "stat_attn_out": ".attn_out",
+    # vLLM -> HF path translation
+    "attn_strip": ".attn",
+    # down_proj stat regex patterns
+    "down_patterns": [
+        r"\.shared_experts\.down_proj",
+        r"\.shared_mlp\.down_proj",
+        r"\.mlp\.down_proj",
+        r"\.experts\.\d+\.down_proj",
+    ],
+    # MLP container regex (used for verification forward)
+    "mlp_containers": [
+        r"\.mlp$",
+        r"mlp\.shared_experts$",
+        r"mlp\.experts\.\d+$",
+    ],
+    # vLLM stat_key -> HF module name aliases (regex sub)
+    "stat_path_aliases": [
+        (r"\.shared_mlp\b", ".shared_experts"),
+    ],
+    # Fused-experts MoE (HYV3Experts-style 3D nn.Parameter)
+    #     gate, up = F.linear(x, gate_up_proj[i]).chunk(2, dim=-1)
+    "fused_down_attr": "down_proj",
+    "fused_gate_up_attr": "gate_up_proj",
+}
+
+
+LLAMA_KEY_MAP = {
+    "q_proj": "q_proj",
+    "k_proj": "k_proj",
+    "v_proj": "v_proj",
+    "o_proj": "o_proj",
+    "down_proj": "down_proj",
+    "up_proj": "up_proj",
+    "qk_norm_flag": "use_qk_norm",
+    "q_norm": "q_norm",
+    "k_norm": "k_norm",
+    "stat_k": ".k",
+    "stat_q": ".q",
+    "stat_attn_out": ".attn_out",
+    "attn_strip": ".attn",
+    "down_patterns": [r"\.mlp\.down_proj"],
+    "mlp_containers": [r"mlp$"],
+}
+
+
+MIXTRAL_KEY_MAP = {
+    "q_proj": "q_proj",
+    "k_proj": "k_proj",
+    "v_proj": "v_proj",
+    "o_proj": "o_proj",
+    "down_proj": "w2",
+    "up_proj": "w3",
+    "qk_norm_flag": "use_qk_norm",
+    "q_norm": "q_norm",
+    "k_norm": "k_norm",
+    "stat_k": ".k",
+    "stat_q": ".q",
+    "stat_attn_out": ".attn_out",
+    "attn_strip": ".attn",
+    "down_patterns": [r"\.block_sparse_moe\.experts\.\d+\.w2"],
+    "mlp_containers": [r"block_sparse_moe\.experts\.\d+$"],
+}
+
+
+QWEN3_MOE_KEY_MAP = {
+    # projection attribute names
+    "q_proj": "q_proj",
+    "k_proj": "k_proj",
+    "v_proj": "v_proj",
+    "o_proj": "o_proj",
+    "down_proj": "down_proj",
+    "up_proj": "up_proj",
+    # qk_norm: Qwen3MoeAttention.forward applies q_norm/k_norm in the
+    # head_dim dim, so we must always fold smooth into them rather than
+    # into q_proj/k_proj (RMSNorm would otherwise absorb the proj-side
+    # scale and break equivalence).  Pointing qk_norm_flag at the always-
+    # truthy ``q_norm`` attribute forces the qk_norm code path.
+    "qk_norm_flag": "q_norm",
+    "q_norm": "q_norm",
+    "k_norm": "k_norm",
+    # stats key suffixes
+    "stat_k": ".k",
+    "stat_q": ".q",
+    "stat_attn_out": ".attn_out",
+    # vLLM -> HF path translation
+    "attn_strip": ".attn",
+    # down_proj stat regex patterns
+    "down_patterns": [
+        r"\.mlp\.down_proj",
+        r"\.experts\.\d+\.down_proj",
+    ],
+    "mlp_containers": [
+        r"mlp$",
+        r"mlp\.experts\.\d+$",
+    ],
+    # Fused-experts MoE (Qwen3MoeExperts)
+    "fused_down_attr": "down_proj",
+    "fused_gate_up_attr": "gate_up_proj",
+}
+
+
+PREDEFINED_KEY_MAPS = {
+    "hy_v3": HY_V3_KEY_MAP,
+    "llama": LLAMA_KEY_MAP,
+    "mixtral": MIXTRAL_KEY_MAP,
+    "qwen3_moe": QWEN3_MOE_KEY_MAP,
+}
+
+DEFAULT_KEY_MAP = HY_V3_KEY_MAP
+
+
+# ===========================================================================
+# Module-discovery helpers
+# ===========================================================================
+#
+# * ``get_submodule_safe`` — name-based submodule lookup with a None
+#   fallback.
+# * ``maybe_materialize`` — context manager that temporarily materialises a
+#   meta-device weight via accelerate hooks for in-place modification, then
+#   offloads it again.
+# * ``attn_key_to_hf_prefix`` — translate a vLLM smooth-stat key to a
+#   HuggingFace ``self_attn`` module path.
+
+
+def get_submodule_safe(model: torch.nn.Module, name: str):
+    """Return a nested submodule by dotted name, or ``None`` if not found."""
+    try:
+        return model.get_submodule(name)
+    except AttributeError:
+        return None
+
+
+@contextlib.contextmanager
+def maybe_materialize(linear: torch.nn.Module, target_device):
+    """Temporarily materialise meta-device weights for in-place
+    modification; offload them back via accelerate hooks.
+
+    If the linear layer has no accelerate hook or weights are not on
+    meta device, this is a no-op and the caller can modify weights
+    directly.
+
+    Usage::
+
+        with maybe_materialize(proj, device):
+            proj.weight.data.mul_(scale)
+    """
+    hook = getattr(linear, "_hf_hook", None)
+    if hook is not None and linear.weight.device.type == "meta":
+        original_exec_device = hook.execution_device
+        hook.execution_device = target_device
+        hook.pre_forward(linear)
+        try:
+            yield
+        finally:
+            hook.post_forward(linear, None)
+            hook.execution_device = original_exec_device
+    else:
+        yield
+
+
+def attn_key_to_hf_prefix(smooth_key_base: str, km: dict = None) -> str:
+    """Map vLLM Attention layer name to HuggingFace module prefix.
+
+    vLLM wraps the raw attention op in a sub-module ``.attn``, so::
+
+        "model.layers.0.self_attn.attn"  ->  "model.layers.0.self_attn"
+
+    If the key does not end with the ``attn_strip`` suffix we return
+    it unchanged (fallback behaviour).
+    """
+    km = km or DEFAULT_KEY_MAP
+    attn_strip = km["attn_strip"]
+    if smooth_key_base.endswith(attn_strip):
+        return smooth_key_base[: -len(attn_strip)]
+    return smooth_key_base
+
+
+# ===========================================================================
 # Attention snapshot / verify
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 def find_first_attn_module(model: torch.nn.Module, smooth_stats: dict, km: dict = None):
@@ -280,9 +491,9 @@ def verify_attn_output_diff(
     print("=" * 70)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # MLP snapshot / verify
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 def _collect_mlp_linears(model: torch.nn.Module, max_layers: int, km: dict = None):

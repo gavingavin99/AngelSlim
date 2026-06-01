@@ -61,7 +61,7 @@ if [ "$SKIP_CALIBRATE" = false ]; then
     echo "[Phase 1] Smooth Stats Calibration"
     echo "========================================"
     mkdir -p logs
-    python3 tools/smooth/run_vllm_smooth.py -c "$CONFIG" > "logs/smooth.log"| tee -a "logs/smooth.log"
+    python3 tools/smooth/run_vllm_smooth.py -c "$CONFIG"
 fi
 
 # -------- Phase 2: Offline Weight Conversion --------

@@ -12,27 +12,147 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Backend-agnostic per-layer alpha grid search.
+"""Smooth statistics I/O and per-layer alpha grid search.
 
-This is the *pure-tensor* core of :class:`SmoothAlphaSearcher`: it
-takes already-collected ``x``, ``w``, ``act_absmax`` tensors (typically
-on a single TP shard) and returns the best alpha + smooth_weight by
-minimising fake-quant MSE.
+Combines:
 
-No distributed primitives, no module discovery, no FusedMoE awareness —
-those concerns live in ``smooth/vllm/searcher_dist.py``.
+* The smooth-stat data structure & JSON I/O — the single bridge between
+  Phase 1 (vLLM online stat collection) and Phase 2 (offline weight
+  conversion).  The JSON file written by ``get_smooth_stats`` is consumed
+  by ``apply_qk_smooth`` / ``apply_vo_smooth`` / ``apply_down_proj_smooth``.
+* The *pure-tensor* core of :class:`SmoothAlphaSearcher`: it takes
+  already-collected ``x``, ``w``, ``act_absmax`` tensors (typically on a
+  single TP shard) and returns the best alpha + smooth_weight by
+  minimising fake-quant MSE.  No distributed primitives, no module
+  discovery, no FusedMoE awareness — those concerns live in
+  ``smooth/vllm/searcher_dist.py``.
 """
 
-from typing import Tuple
+import json
+import os
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 
-from .formulas import smooth_default, smooth_per_tensor_act_first
-from .qdq import smooth_qdq_act, smooth_qdq_weight
+from .tensor_math import (
+    smooth_default,
+    smooth_per_tensor_act_first,
+    smooth_qdq_act,
+    smooth_qdq_weight,
+)
 
 __all__ = [
+    # smooth_stats
+    "SmoothStats",
+    "load_smooth_stats",
+    "save_smooth_stats",
+    "load_alpha_search_results",
+    "save_alpha_search_results",
+    # searcher
     "smooth_alpha_search_layer",
 ]
+
+
+# ===========================================================================
+# Smooth-stat data structure & JSON I/O
+# ===========================================================================
+
+
+@dataclass
+class SmoothStats:
+    """A single layer's smooth statistics."""
+
+    absmax: Optional[torch.Tensor]  # [C] per-channel absmax
+    ema: Optional[torch.Tensor]  # [C] per-channel EMA
+    call_count: int = 0
+
+
+def load_smooth_stats(json_path: str, use_ema: bool = False) -> dict:
+    """Load smooth stats from JSON file and convert lists back to tensors.
+
+    The original ``smooth_stats.json`` schema is::
+
+        {
+          "<layer_key>": {
+            "absmax": [float, ...],
+            "ema":    [float, ...],
+            "call_count": int
+          },
+          ...
+        }
+
+    Args:
+        json_path: path to smooth_stats.json.
+        use_ema: if True, use the EMA field as the per-channel scale;
+            otherwise use absmax.
+
+    Returns:
+        ``dict[layer_key, {"scale": Tensor[C], "call_count": int}]``.
+    """
+    with open(json_path, "r") as f:
+        raw = json.load(f)
+
+    field = "ema" if use_ema else "absmax"
+    out = {}
+    for key, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        vals = entry.get(field)
+        if vals is None:
+            continue
+        out[key] = {
+            "scale": torch.tensor(vals, dtype=torch.float32),
+            "call_count": int(entry.get("call_count", 0)),
+        }
+    return out
+
+
+def save_smooth_stats(stats: dict, json_path: str) -> None:
+    """Serialise ``model._smooth_stats``-shaped data to JSON.
+
+    Args:
+        stats: the dict returned by ``get_smooth_stats(model)`` — already
+            JSON-serialisable (lists, ints).
+        json_path: target file path.
+    """
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(stats, f, indent=2)
+
+
+def load_alpha_search_results(json_path: str) -> dict:
+    """Load smooth_alpha_search.json.
+
+    Returns the inner ``"results"`` dict if present, otherwise the whole
+    payload (for forwards compat with older / flatter formats)::
+
+        {
+          "<layer_key>": {
+            "alpha": [float, ...],     # per-rank list under TP
+            "smooth_weight": [float],  # full [intermediate_size]
+            "loss": float
+          },
+          ...
+        }
+    """
+    with open(json_path, "r") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and "results" in raw:
+        return raw["results"]
+    return raw
+
+
+def save_alpha_search_results(payload: dict, json_path: str) -> None:
+    """Save alpha search payload (config + results) to JSON."""
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+# ===========================================================================
+# Per-layer alpha grid search
+# ===========================================================================
 
 
 def smooth_alpha_search_layer(

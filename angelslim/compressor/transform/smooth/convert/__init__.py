@@ -18,20 +18,23 @@ Re-exports the public API consumed by
 ``tools/smooth/convert_smooth_weights.py`` (Phase 2 driver).
 """
 
-from .apply_down import apply_down_proj_smooth, apply_down_proj_smooth_from_search
-from .apply_qk import apply_qk_smooth
-from .apply_vo import apply_vo_smooth
-from .key_maps import (
+from .apply_funcs import (
+    apply_down_proj_smooth,
+    apply_down_proj_smooth_from_search,
+    apply_qk_smooth,
+    apply_vo_smooth,
+)
+from .utils import (
     DEFAULT_KEY_MAP,
     HY_V3_KEY_MAP,
     LLAMA_KEY_MAP,
     MIXTRAL_KEY_MAP,
     PREDEFINED_KEY_MAPS,
     QWEN3_MOE_KEY_MAP,
-)
-from .module_finder import attn_key_to_hf_prefix, get_submodule_safe, maybe_materialize
-from .snapshot import (
+    attn_key_to_hf_prefix,
     find_first_attn_module,
+    get_submodule_safe,
+    maybe_materialize,
     snapshot_attn_output_before,
     snapshot_mlp_outputs_before,
     verify_attn_output_diff,

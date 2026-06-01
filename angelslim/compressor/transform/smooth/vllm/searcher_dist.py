@@ -34,7 +34,7 @@ import torch
 from angelslim.compressor.quant.core.vllm_calibrate_utils._common import _get_dist_info
 
 from ..config import SmoothAlphaSearchConfig
-from ..core.searcher import smooth_alpha_search_layer
+from ..core.stats_search import smooth_alpha_search_layer
 
 __all__ = [
     "SmoothAlphaSearcher",

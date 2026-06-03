@@ -5,6 +5,6 @@
 
 set -euo pipefail
 
-CONFIG="configs/Hy3/ptq/fp8/hy3_smooth.yaml"
+CONFIG="configs/Hy3/ptq/fp8/Hy3_smooth.yaml"
 
 python3 tools/smooth/convert_smooth_weights.py -c "$CONFIG" "$@"
